@@ -1,0 +1,706 @@
+"""
+SVXY / VIX Spike Backtest — Real Data + Visualization
+======================================================
+Pulls actual SVXY and VIX price history, finds every VIX spike
+above a threshold since 2022, simulates entries/exits, and renders
+a 5-panel dashboard saved as PNG.
+
+Data sources:
+  polygon  — free account at https://polygon.io
+  alpaca   — free account at https://alpaca.markets
+  yfinance — no key required (default, may rate-limit)
+
+Usage:
+  pip install requests pandas numpy matplotlib tabulate yfinance
+
+  python svxy_vix_backtest.py                          # yfinance, default params
+  python svxy_vix_backtest.py --source polygon --key KEY
+  python svxy_vix_backtest.py --source alpaca  --key KEY --secret SECRET
+  python svxy_vix_backtest.py --no-plot                # skip chart output
+"""
+
+import argparse
+import sys
+from datetime import datetime
+
+import pandas as pd
+import numpy as np
+import matplotlib
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+import matplotlib.dates as mdates
+import matplotlib.ticker as mticker
+from matplotlib.gridspec import GridSpec
+
+# ─── config ───────────────────────────────────────────────────────────────────
+START_DATE   = "2022-01-01"
+END_DATE     = datetime.today().strftime("%Y-%m-%d")
+VIX_THRESH   = 30       # VIX peak threshold
+PEAK_WINDOW  = 5        # local-max lookback/forward (trading days)
+MIN_GAP_DAYS = 20       # min days between distinct episodes
+EXIT_VIX     = 20       # exit when VIX closes below this level
+MAX_HOLD     = 180      # hard time-stop (calendar days)
+INITIAL_CAP  = 10_000   # starting capital for equity curve ($)
+# ──────────────────────────────────────────────────────────────────────────────
+
+# ─── chart colour palette (dark theme) ───────────────────────────────────────
+C_VIX    = "#e24b4a"   # red    - VIX line
+C_SVXY   = "#378add"   # blue   - SVXY price line
+C_ENTRY  = "#ef4444"   # red    - entry marker
+C_EXIT   = "#22c55e"   # green  - exit marker
+C_WIN    = "#22c55e"   # green  - profitable trade shading
+C_LOSS   = "#ef4444"   # red    - losing trade shading
+C_OPEN   = "#f59e0b"   # amber  - open / live trade
+C_THRESH = "#888780"   # grey   - VIX threshold dashed line
+C_EQUITY = "#7f77dd"   # purple - strategy equity curve
+C_BH     = "#888780"   # grey   - buy-and-hold benchmark
+C_DD     = "#ef4444"   # red    - drawdown fill
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+# ===============================================================================
+#  DATA FETCHERS
+# ===============================================================================
+
+def fetch_polygon(ticker, start, end, api_key):
+    """Fetch daily adjusted close from Polygon.io REST v2 aggregates."""
+    import requests
+    poly_ticker = "I:VIX" if ticker == "^VIX" else ticker
+    url = (
+        f"https://api.polygon.io/v2/aggs/ticker/{poly_ticker}/range"
+        f"/1/day/{start}/{end}"
+        f"?adjusted=true&sort=asc&limit=50000&apiKey={api_key}"
+    )
+    r = requests.get(url, timeout=15)
+    r.raise_for_status()
+    data = r.json()
+    if data.get("resultsCount", 0) == 0:
+        raise ValueError(f"No Polygon data for {poly_ticker}. "
+                         "Check ticker or API key tier.")
+    df = pd.DataFrame(data["results"])
+    df["date"] = pd.to_datetime(df["t"], unit="ms").dt.normalize()
+    return df.set_index("date").sort_index()["c"].rename(ticker)
+
+
+def fetch_alpaca(ticker, start, end, api_key, api_secret):
+    """Fetch daily bars from Alpaca Markets data API."""
+    import requests
+    sym = ticker
+    if ticker == "^VIX":
+        sym = "VIXY"   # Alpaca free tier - VIXY is a 1x VIX proxy
+        print("  [alpaca] Using VIXY as VIX proxy "
+              "(^VIX index not on free tier)")
+    headers = {
+        "APCA-API-KEY-ID":     api_key,
+        "APCA-API-SECRET-KEY": api_secret,
+    }
+    url = (
+        f"https://data.alpaca.markets/v2/stocks/{sym}/bars"
+        f"?start={start}&end={end}&timeframe=1Day&limit=10000&feed=iex"
+    )
+    r = requests.get(url, headers=headers, timeout=15)
+    r.raise_for_status()
+    bars = r.json().get("bars", [])
+    if not bars:
+        raise ValueError(f"No Alpaca bars for {sym}.")
+    df = pd.DataFrame(bars)
+    df["date"] = pd.to_datetime(df["t"]).dt.normalize()
+    return df.set_index("date").sort_index()["c"].rename(ticker)
+
+
+def fetch_yfinance(ticker, start, end):
+    """Fetch adjusted close from yfinance (no key needed)."""
+    import yfinance as yf
+    data = yf.download(ticker, start=start, end=end,
+                       auto_adjust=True, progress=False)
+    if data.empty:
+        raise ValueError(f"yfinance returned no data for {ticker}.")
+    return data["Close"].squeeze().rename(ticker)
+
+
+def load_data(source, args):
+    """Dispatch to the chosen data source and align series on common dates."""
+    print(f"\nFetching data from {source} ...")
+    if source == "polygon":
+        if not args.key:
+            sys.exit("--key required for Polygon.io. "
+                     "Sign up free at https://polygon.io")
+        vix  = fetch_polygon("^VIX",  START_DATE, END_DATE, args.key)
+        svxy = fetch_polygon("SVXY",  START_DATE, END_DATE, args.key)
+    elif source == "alpaca":
+        if not args.key or not args.secret:
+            sys.exit("--key and --secret required for Alpaca. "
+                     "Sign up free at https://alpaca.markets")
+        vix  = fetch_alpaca("^VIX",  START_DATE, END_DATE, args.key, args.secret)
+        svxy = fetch_alpaca("SVXY",  START_DATE, END_DATE, args.key, args.secret)
+    elif source == "yfinance":
+        print("  Using yfinance (no key - may rate-limit on repeated runs)")
+        vix  = fetch_yfinance("^VIX",  START_DATE, END_DATE)
+        svxy = fetch_yfinance("SVXY",  START_DATE, END_DATE)
+    else:
+        sys.exit(f"Unknown source: {source}")
+
+    common = vix.index.intersection(svxy.index)
+    vix, svxy = vix[common], svxy[common]
+    print(f"  VIX  : {len(vix)} rows  "
+          f"({vix.index[0].date()} -> {vix.index[-1].date()})")
+    print(f"  SVXY : {len(svxy)} rows  "
+          f"({svxy.index[0].date()} -> {svxy.index[-1].date()})")
+    return vix, svxy
+
+
+# ===============================================================================
+#  BACKTEST ENGINE
+# ===============================================================================
+
+def find_spike_episodes(vix: pd.Series) -> list:
+    """
+    Return positional indices of local VIX closes that are:
+      - above VIX_THRESH
+      - a local maximum within +/- PEAK_WINDOW trading days
+      - at least MIN_GAP_DAYS apart (one episode per crisis)
+    """
+    vals = vix.values
+    candidates = []
+    for i in range(PEAK_WINDOW, len(vals) - PEAK_WINDOW):
+        if vals[i] >= VIX_THRESH:
+            lo = max(0, i - PEAK_WINDOW)
+            hi = min(len(vals), i + PEAK_WINDOW + 1)
+            if vals[i] == vals[lo:hi].max():
+                candidates.append(i)
+
+    episodes, last = [], -999
+    for i in candidates:
+        if i - last > MIN_GAP_DAYS:
+            episodes.append(i)
+            last = i
+    return episodes
+
+
+def run_backtest(vix: pd.Series, svxy: pd.Series,
+                 episodes: list) -> pd.DataFrame:
+    """
+    For each episode:
+      Entry  -> next trading-day close after the VIX peak
+      Exit   -> first close where VIX < EXIT_VIX  (or MAX_HOLD days hard stop)
+    """
+    records = []
+    n = len(vix)
+
+    for pi in episodes:
+        peak_date  = vix.index[pi]
+        vix_peak   = round(float(vix.iloc[pi]), 2)
+
+        ei = pi + 1
+        if ei >= n:
+            continue
+        entry_date  = svxy.index[ei]
+        entry_price = round(float(svxy.iloc[ei]), 2)
+
+        exit_date = exit_price = exit_vix = None
+        exit_type = "open"
+        for ji in range(ei + 1, n):
+            days_elapsed = (vix.index[ji] - entry_date).days
+            if days_elapsed > MAX_HOLD:
+                exit_date  = vix.index[ji]
+                exit_price = round(float(svxy.iloc[ji]), 2)
+                exit_vix   = round(float(vix.iloc[ji]),  2)
+                exit_type  = "time-stop"
+                break
+            if float(vix.iloc[ji]) < EXIT_VIX:
+                exit_date  = vix.index[ji]
+                exit_price = round(float(svxy.iloc[ji]), 2)
+                exit_vix   = round(float(vix.iloc[ji]),  2)
+                exit_type  = "VIX<20"
+                break
+
+        days_held  = (exit_date - entry_date).days if exit_date else None
+        return_pct = (
+            round((exit_price - entry_price) / entry_price * 100, 2)
+            if exit_price else None
+        )
+
+        records.append({
+            "VIX peak date": peak_date.strftime("%Y-%m-%d"),
+            "VIX peak":      vix_peak,
+            "Entry date":    entry_date.strftime("%Y-%m-%d"),
+            "Entry $":       entry_price,
+            "Exit date":     exit_date.strftime("%Y-%m-%d") if exit_date else "OPEN",
+            "Exit $":        exit_price,
+            "VIX at exit":   exit_vix,
+            "Days held":     days_held,
+            "Return %":      return_pct,
+            "Exit type":     exit_type,
+        })
+
+    return pd.DataFrame(records)
+
+
+def print_results(df: pd.DataFrame):
+    """Print trade log table and summary statistics to console."""
+    try:
+        from tabulate import tabulate
+        print("\n" + tabulate(df, headers="keys",
+                              tablefmt="rounded_outline",
+                              showindex=False, floatfmt=".2f"))
+    except ImportError:
+        print("\n" + df.to_string(index=False))
+
+    completed = df[df["Return %"].notna()]
+    winners   = completed[completed["Return %"] > 0]
+
+    print("\n-- Summary ---------------------------------------------------")
+    print(f"  Episodes found    : {len(df)}")
+    print(f"  Completed trades  : {len(completed)}")
+    print(f"  Open (live)       : {len(df) - len(completed)}")
+    if len(completed):
+        print(f"  Win rate          : {len(winners)}/{len(completed)} "
+              f"= {len(winners)/len(completed)*100:.0f}%")
+        print(f"  Avg return        : {completed['Return %'].mean():.1f}%")
+        print(f"  Median return     : {completed['Return %'].median():.1f}%")
+        best_idx = completed['Return %'].idxmax()
+        wrst_idx = completed['Return %'].idxmin()
+        print(f"  Best trade        : {completed.loc[best_idx, 'Return %']:.1f}%"
+              f"  ({completed.loc[best_idx, 'VIX peak date']})")
+        print(f"  Worst trade       : {completed.loc[wrst_idx, 'Return %']:.1f}%"
+              f"  ({completed.loc[wrst_idx, 'VIX peak date']})")
+        print(f"  Avg days held     : {completed['Days held'].mean():.0f}")
+        print(f"  Max days held     : {completed['Days held'].max()}")
+    print("--------------------------------------------------------------")
+
+    open_trades = df[df["Exit type"] == "open"]
+    if not open_trades.empty:
+        t = open_trades.iloc[-1]
+        print(f"\n  LIVE TRADE -> entered {t['Entry date']} @ ${t['Entry $']:.2f}")
+        print(f"  VIX was {t['VIX peak']} at peak.  "
+              f"Waiting for VIX < {EXIT_VIX} to exit.")
+
+
+# ===============================================================================
+#  VISUALIZATION  --  5-panel backtest dashboard
+# ===============================================================================
+
+def _to_ts(s):
+    """Convert 'YYYY-MM-DD' string to Timestamp; return NaT for 'OPEN'."""
+    return pd.NaT if (not s or s == "OPEN") else pd.Timestamp(s)
+
+
+def _shade(ax, entry_d, exit_d, last_date, color, alpha=0.12):
+    """Shade a date range on any axis between entry and exit."""
+    if pd.isna(entry_d):
+        return
+    x1 = last_date if pd.isna(exit_d) else exit_d
+    ax.axvspan(entry_d, x1, color=color, alpha=alpha, linewidth=0)
+
+
+def _fmt_x(ax, dates):
+    """Apply consistent x-axis date formatting."""
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%b '%y"))
+    ax.xaxis.set_major_locator(mdates.MonthLocator(interval=3))
+    ax.set_xlim(dates[0], dates[-1])
+    ax.grid(True, axis="y", zorder=0)
+
+
+def _trade_color(ret, is_open):
+    """Return the right colour for a trade based on outcome."""
+    if is_open:
+        return C_OPEN
+    return C_WIN if (ret or 0) >= 0 else C_LOSS
+
+
+def plot_results(vix: pd.Series, svxy: pd.Series,
+                 results: pd.DataFrame, episodes: list,
+                 save_path: str = ""):
+    """
+    Five-panel backtest dashboard:
+
+    Panel 1  VIX time series  -- threshold line, spike labels, trade shading
+    Panel 2  SVXY price       -- entry/exit markers, per-trade return labels
+    Panel 3  Per-trade bars   -- green win, red loss, amber open
+    Panel 4  Equity curve     -- strategy compounding vs buy-and-hold SVXY
+    Panel 5  Drawdown         -- underwater curve from equity high-water mark
+    """
+
+    # dark theme
+    matplotlib.rcParams.update({
+        "figure.facecolor": "#0f0f0f",
+        "axes.facecolor":   "#161616",
+        "axes.edgecolor":   "#2a2a2a",
+        "axes.labelcolor":  "#cccccc",
+        "xtick.color":      "#888888",
+        "ytick.color":      "#888888",
+        "text.color":       "#dddddd",
+        "grid.color":       "#222222",
+        "grid.linewidth":   0.5,
+        "font.family":      "monospace",
+        "font.size":        9,
+    })
+
+    dates     = vix.index
+    last_date = dates[-1]
+    completed = results[results["Return %"].notna()].copy()
+    open_tr   = results[results["Exit type"] == "open"].copy()
+
+    fig = plt.figure(figsize=(16, 22))
+    fig.suptitle(
+        f"SVXY / VIX Mean-Reversion Backtest  |  "
+        f"Entry: VIX >= {VIX_THRESH}  |  Exit: VIX < {EXIT_VIX}  |  "
+        f"{START_DATE} to {END_DATE}",
+        fontsize=13, fontweight="bold", color="#ffffff", y=0.99
+    )
+
+    gs = GridSpec(5, 1, figure=fig,
+                  hspace=0.55,
+                  height_ratios=[1.6, 1.6, 1.1, 1.5, 0.9])
+    ax_vix  = fig.add_subplot(gs[0])
+    ax_svxy = fig.add_subplot(gs[1])
+    ax_bars = fig.add_subplot(gs[2])
+    ax_eq   = fig.add_subplot(gs[3])
+    ax_dd   = fig.add_subplot(gs[4])
+
+    # -------------------------------------------------------------------------
+    # Panel 1 -- VIX time series
+    # -------------------------------------------------------------------------
+    ax_vix.plot(dates, vix.values, color=C_VIX, linewidth=1.3, zorder=3)
+
+    # fill area above threshold
+    ax_vix.fill_between(dates, vix.values, VIX_THRESH,
+                        where=(vix.values >= VIX_THRESH),
+                        color=C_VIX, alpha=0.18, zorder=2)
+
+    # threshold and exit reference lines
+    ax_vix.axhline(VIX_THRESH, color=C_THRESH, linewidth=0.9,
+                   linestyle="--", label=f"Entry threshold  VIX {VIX_THRESH}")
+    ax_vix.axhline(EXIT_VIX, color=C_EXIT, linewidth=0.8,
+                   linestyle=":", alpha=0.7,
+                   label=f"Exit level  VIX {EXIT_VIX}")
+
+    # shade each trade window
+    for _, row in results.iterrows():
+        ed = _to_ts(row["Entry date"])
+        xd = _to_ts(row["Exit date"])
+        _shade(ax_vix, ed, xd, last_date,
+               _trade_color(row["Return %"], pd.isna(xd)), alpha=0.10)
+
+    # annotate peak VIX values above each spike
+    for i in episodes:
+        ax_vix.annotate(
+            f"{vix.iloc[i]:.0f}",
+            xy=(dates[i], float(vix.iloc[i])),
+            xytext=(0, 9), textcoords="offset points",
+            ha="center", fontsize=7.5, color="#ff9999",
+            arrowprops=dict(arrowstyle="-", color="#ff9999", lw=0.5)
+        )
+
+    ax_vix.set_ylabel("VIX")
+    ax_vix.set_title(
+        "VIX -- red fill = above threshold  |  "
+        "green shade = win  |  red shade = loss  |  amber = open",
+        loc="left", fontsize=8.5, color="#888888")
+    ax_vix.legend(fontsize=8, loc="upper right",
+                  facecolor="#1a1a1a", edgecolor="#333333")
+    _fmt_x(ax_vix, dates)
+
+    # -------------------------------------------------------------------------
+    # Panel 2 -- SVXY price with entry/exit markers
+    # -------------------------------------------------------------------------
+    ax_svxy.plot(dates, svxy.values, color=C_SVXY, linewidth=1.3, zorder=3)
+
+    for _, row in results.iterrows():
+        ed  = _to_ts(row["Entry date"])
+        xd  = _to_ts(row["Exit date"])
+        ep  = row["Entry $"]
+        xp  = row["Exit $"]
+        ret = row["Return %"]
+        is_open = pd.isna(xd)
+
+        if pd.isna(ed) or ep is None:
+            continue
+
+        color = _trade_color(ret, is_open)
+        _shade(ax_svxy, ed, xd, last_date, color, alpha=0.15)
+
+        # entry marker (downward triangle)
+        ax_svxy.scatter(ed, ep, color=C_ENTRY, s=65, zorder=5,
+                        marker="v", linewidths=0)
+
+        if not is_open and xp is not None:
+            # exit marker (upward triangle)
+            ax_svxy.scatter(xd, xp, color=C_EXIT, s=65, zorder=5,
+                            marker="^", linewidths=0)
+            # dashed line connecting entry to exit
+            ax_svxy.plot([ed, xd], [ep, xp],
+                         color=color, linewidth=0.8,
+                         linestyle="--", alpha=0.50, zorder=4)
+            # return label above the midpoint
+            mid_x = ed + (xd - ed) / 2
+            y_range = float(svxy.values.max() - svxy.values.min())
+            label_y = max(ep, xp) + y_range * 0.025
+            ax_svxy.annotate(
+                f"{'+' if ret >= 0 else ''}{ret:.1f}%",
+                xy=(mid_x, label_y),
+                ha="center", fontsize=8, fontweight="bold",
+                color=C_WIN if ret >= 0 else C_LOSS
+            )
+        elif is_open and ep is not None:
+            ax_svxy.annotate(
+                "LIVE", xy=(ed, ep),
+                xytext=(6, 8), textcoords="offset points",
+                fontsize=8, color=C_OPEN, fontweight="bold"
+            )
+
+    legend_patches = [
+        mpatches.Patch(color=C_ENTRY, label="Entry (down triangle)"),
+        mpatches.Patch(color=C_EXIT,  label="Exit  (up triangle)"),
+        mpatches.Patch(color=C_WIN,   alpha=0.6, label="Win"),
+        mpatches.Patch(color=C_LOSS,  alpha=0.6, label="Loss"),
+        mpatches.Patch(color=C_OPEN,  alpha=0.6, label="Open / live"),
+    ]
+    ax_svxy.legend(handles=legend_patches, fontsize=8, loc="upper left",
+                   facecolor="#1a1a1a", edgecolor="#333333", ncol=5)
+    ax_svxy.set_ylabel("SVXY ($)")
+    ax_svxy.set_title(
+        "SVXY price -- entry day after VIX peak  |  "
+        "exit when VIX < 20  |  return label at midpoint",
+        loc="left", fontsize=8.5, color="#888888")
+    _fmt_x(ax_svxy, dates)
+
+    # -------------------------------------------------------------------------
+    # Panel 3 -- Per-trade return bars
+    # -------------------------------------------------------------------------
+    bar_data = []
+    for _, row in completed.iterrows():
+        bar_data.append({
+            "label": f"{row['VIX peak date'][2:7]}\nVIX {row['VIX peak']:.0f}",
+            "ret":   row["Return %"],
+            "color": C_WIN if row["Return %"] >= 0 else C_LOSS,
+        })
+    for _, row in open_tr.iterrows():
+        bar_data.append({
+            "label": f"{row['VIX peak date'][2:7]}\nOPEN",
+            "ret":   0.0,
+            "color": C_OPEN,
+        })
+
+    if bar_data:
+        xs     = np.arange(len(bar_data))
+        rets   = [d["ret"]   for d in bar_data]
+        colors = [d["color"] for d in bar_data]
+        labels = [d["label"] for d in bar_data]
+
+        bars_plot = ax_bars.bar(xs, rets, color=colors,
+                                width=0.6, zorder=3, alpha=0.85)
+        ax_bars.axhline(0, color="#555555", linewidth=0.8)
+
+        non_zero = [r for r in rets if r != 0]
+        if non_zero:
+            avg = np.mean(non_zero)
+            ax_bars.axhline(avg, color="#f59e0b", linewidth=1.1,
+                            linestyle="--",
+                            label=f"Avg return  {avg:+.1f}%")
+            ax_bars.legend(fontsize=8, loc="upper right",
+                           facecolor="#1a1a1a", edgecolor="#333333")
+
+        # value labels on each bar
+        for bar, val in zip(bars_plot, rets):
+            if val == 0:
+                continue
+            offset = 0.9 if val >= 0 else -2.8
+            ax_bars.text(
+                bar.get_x() + bar.get_width() / 2,
+                val + offset,
+                f"{'+' if val > 0 else ''}{val:.1f}%",
+                ha="center", fontsize=8,
+                color=C_WIN if val >= 0 else C_LOSS
+            )
+
+        ax_bars.set_xticks(xs)
+        ax_bars.set_xticklabels(labels, fontsize=8)
+        ax_bars.set_ylabel("Return %")
+        ax_bars.set_title(
+            "Per-trade returns -- green = win, red = loss, amber = open",
+            loc="left", fontsize=8.5, color="#888888")
+        ax_bars.grid(True, axis="y", zorder=0)
+    else:
+        ax_bars.text(0.5, 0.5, "No completed trades yet",
+                     ha="center", va="center",
+                     transform=ax_bars.transAxes,
+                     color="#888888", fontsize=11)
+
+    # -------------------------------------------------------------------------
+    # Panel 4 -- Compounding equity curve vs buy-and-hold SVXY
+    # -------------------------------------------------------------------------
+    # Build strategy equity: reinvest 100% of capital on each signal
+    eq_x   = [dates[0]]
+    eq_y   = [float(INITIAL_CAP)]
+    capital = float(INITIAL_CAP)
+
+    for _, row in results.sort_values("Entry date").iterrows():
+        ed  = _to_ts(row["Entry date"])
+        xd  = _to_ts(row["Exit date"])
+        ret = row["Return %"]
+        if pd.isna(ed) or ret is None:
+            continue
+        eq_x.append(ed)
+        eq_y.append(capital)
+        capital *= (1.0 + ret / 100.0)
+        eq_x.append(last_date if pd.isna(xd) else xd)
+        eq_y.append(capital)
+
+    eq_x.append(last_date)
+    eq_y.append(capital)
+
+    # buy-and-hold: same starting capital in SVXY from day 1
+    bh_curve = (svxy.values / float(svxy.iloc[0])) * INITIAL_CAP
+    bh_final = float(bh_curve[-1])
+    strat_ret = (capital - INITIAL_CAP) / INITIAL_CAP * 100
+    bh_ret    = (bh_final - INITIAL_CAP) / INITIAL_CAP * 100
+
+    ax_eq.plot(eq_x, eq_y, color=C_EQUITY, linewidth=1.6, zorder=4,
+               label=f"Strategy    ${capital:,.0f}  ({strat_ret:+.1f}%)")
+    ax_eq.plot(dates, bh_curve, color=C_BH, linewidth=1.0,
+               linestyle="--", alpha=0.65, zorder=3,
+               label=f"Buy & hold  ${bh_final:,.0f}  ({bh_ret:+.1f}%)")
+    ax_eq.axhline(INITIAL_CAP, color="#444444",
+                  linewidth=0.7, linestyle=":")
+
+    ax_eq.fill_between(
+        eq_x, INITIAL_CAP, eq_y,
+        where=[v >= INITIAL_CAP for v in eq_y],
+        color=C_WIN, alpha=0.08
+    )
+    ax_eq.fill_between(
+        eq_x, INITIAL_CAP, eq_y,
+        where=[v < INITIAL_CAP for v in eq_y],
+        color=C_LOSS, alpha=0.08
+    )
+
+    ax_eq.set_ylabel("Portfolio ($)")
+    ax_eq.set_title(
+        f"Equity curve -- ${INITIAL_CAP:,} start, "
+        "100% capital per trade, compounding",
+        loc="left", fontsize=8.5, color="#888888")
+    ax_eq.legend(fontsize=8.5, loc="upper left",
+                 facecolor="#1a1a1a", edgecolor="#333333")
+    ax_eq.yaxis.set_major_formatter(
+        mticker.FuncFormatter(lambda x, _: f"${x:,.0f}"))
+    _fmt_x(ax_eq, dates)
+
+    # -------------------------------------------------------------------------
+    # Panel 5 -- Drawdown from equity high-water mark
+    # -------------------------------------------------------------------------
+    eq_series = (
+        pd.Series(eq_y, index=pd.DatetimeIndex(eq_x))
+        .reindex(dates, method="ffill")
+        .ffill()
+        .bfill()
+    )
+    rolling_peak = eq_series.cummax()
+    drawdown     = (eq_series - rolling_peak) / rolling_peak * 100
+
+    ax_dd.fill_between(dates, drawdown.values, 0, color=C_DD, alpha=0.30)
+    ax_dd.plot(dates, drawdown.values, color=C_DD, linewidth=0.9)
+    ax_dd.axhline(0, color="#555555", linewidth=0.6)
+
+    max_dd      = float(drawdown.min())
+    max_dd_date = drawdown.idxmin()
+    ax_dd.annotate(
+        f"Max DD  {max_dd:.1f}%",
+        xy=(max_dd_date, max_dd),
+        xytext=(25, -12), textcoords="offset points",
+        fontsize=8, color=C_DD,
+        arrowprops=dict(arrowstyle="->", color=C_DD, lw=0.8)
+    )
+
+    ax_dd.set_ylabel("Drawdown %")
+    ax_dd.set_title("Drawdown from equity high-water mark",
+                    loc="left", fontsize=8.5, color="#888888")
+    _fmt_x(ax_dd, dates)
+
+    # -------------------------------------------------------------------------
+    # Stats summary box
+    # -------------------------------------------------------------------------
+    all_rets = completed["Return %"].dropna().tolist()
+    if all_rets:
+        win_rate = sum(1 for r in all_rets if r > 0) / len(all_rets) * 100
+        stats = (
+            f"  Trades : {len(all_rets)}\n"
+            f"  Win %  : {win_rate:.0f}%\n"
+            f"  Avg    : {np.mean(all_rets):+.1f}%\n"
+            f"  Best   : {max(all_rets):+.1f}%\n"
+            f"  Worst  : {min(all_rets):+.1f}%\n"
+            f"  Max DD : {max_dd:.1f}%\n"
+            f"  Strat  : {strat_ret:+.1f}%\n"
+            f"  B&H    : {bh_ret:+.1f}%"
+        )
+        fig.text(0.76, 0.03, stats,
+                 fontsize=8.5, family="monospace", color="#cccccc",
+                 bbox=dict(boxstyle="round,pad=0.6",
+                           facecolor="#1a1a1a",
+                           edgecolor="#444444", alpha=0.92))
+
+    # save + display
+    out_png = save_path or \
+        f"svxy_backtest_{datetime.today().strftime('%Y%m%d')}.png"
+    plt.savefig(out_png, dpi=150, bbox_inches="tight",
+                facecolor=fig.get_facecolor())
+    print(f"\n  Chart saved -> {out_png}")
+    plt.show()
+
+
+# ===============================================================================
+#  MAIN
+# ===============================================================================
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="SVXY / VIX spike mean-reversion backtest + visualization")
+    parser.add_argument("--source",   default="yfinance",
+                        choices=["polygon", "alpaca", "yfinance"])
+    parser.add_argument("--key",      default=None,
+                        help="API key (Polygon or Alpaca)")
+    parser.add_argument("--secret",   default=None,
+                        help="API secret (Alpaca only)")
+    parser.add_argument("--thresh",   type=float, default=VIX_THRESH,
+                        help=f"VIX entry threshold (default {VIX_THRESH})")
+    parser.add_argument("--exit-vix", type=float, default=EXIT_VIX,
+                        help=f"VIX exit level (default {EXIT_VIX})")
+    parser.add_argument("--no-plot",  action="store_true",
+                        help="Skip chart rendering (headless servers)")
+    parser.add_argument("--save-png", default="",
+                        help="Custom output path for chart PNG")
+    args = parser.parse_args([])   # uses defaults; swap to parse_args()
+                                   # to accept CLI flags
+
+    print("=" * 62)
+    print("  SVXY / VIX Spike Backtest")
+    print(f"  Period     : {START_DATE}  to  {END_DATE}")
+    print(f"  Entry      : Day after VIX closes >= {args.thresh}")
+    print(f"  Exit       : VIX first closes < {args.exit_vix}"
+          f"  (hard stop {MAX_HOLD}d)")
+    print(f"  Capital    : ${INITIAL_CAP:,}  (100% in per trade)")
+    print(f"  Data source: {args.source}")
+    print("=" * 62)
+
+    vix, svxy = load_data(args.source, args)
+
+    episodes = find_spike_episodes(vix)
+    print(f"\nSpike episodes detected: {len(episodes)}")
+    for i in episodes:
+        print(f"  {vix.index[i].strftime('%Y-%m-%d')}  VIX = {vix.iloc[i]:.1f}")
+
+    results = run_backtest(vix, svxy, episodes)
+    print_results(results)
+
+    csv_path = (f"svxy_backtest_{args.source}_"
+                f"{datetime.today().strftime('%Y%m%d')}.csv")
+    results.to_csv(csv_path, index=False)
+    print(f"\n  Trade log saved -> {csv_path}")
+
+    if not args.no_plot:
+        plot_results(vix, svxy, results, episodes,
+                     save_path=args.save_png)
+
+
+if __name__ == "__main__":
+    main()
