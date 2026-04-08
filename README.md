@@ -5,6 +5,8 @@ Pulls actual SVXY and VIX price history, finds every VIX spike
 above a threshold since 2022, simulates entries/exits, and renders
 a 5-panel dashboard saved as PNG.
 
+Strategy is basically shorting the high VIX above threshold of 30 and then close the position when VIX lowers to 20. You can short it directly or via ETF.
+
 Data sources:
   polygon  — free account at https://polygon.io
   alpaca   — free account at https://alpaca.markets
