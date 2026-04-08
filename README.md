@@ -1,4 +1,4 @@
-# VIXStrategy
+# VIXStrategyandBacktest
 SVXY / VIX Spike Backtest — Real Data + Visualization
 ======================================================
 Pulls actual SVXY and VIX price history, finds every VIX spike
